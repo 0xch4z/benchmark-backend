@@ -1,1 +1,4 @@
 benchmark-backend
+openssl-san.conf
+server.key
+server.crt

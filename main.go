@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 	"unsafe"
 
+	"github.com/dgrr/http2"
 	"github.com/valyala/fasthttp"
 	"golang.org/x/sys/unix"
 )
@@ -23,6 +25,7 @@ var (
 	concurrency int
 	tlsCert     string
 	tlsKey      string
+	enableH2    bool
 )
 
 func init() {
@@ -31,8 +34,9 @@ func init() {
 	flag.BoolVar(&compress, "compress", false, "Compress the response payload")
 	flag.BoolVar(&debug, "debug", false, "Debug request host and remote IP")
 	flag.IntVar(&concurrency, "concurrency", 1, "Number of listening sockets (>=2 uses SO_REUSEPORT)")
-	flag.StringVar(&tlsCert, "tls-cert", "", "Path to TLS certificate (PEM). If set, TLS 1.3 is enabled")
-	flag.StringVar(&tlsKey, "tls-key", "", "Path to TLS private key (PEM). If set, TLS 1.3 is enabled")
+	flag.StringVar(&tlsCert, "tls-cert", "", "Path to TLS certificate (PEM)")
+	flag.StringVar(&tlsKey, "tls-key", "", "Path to TLS private key (PEM)")
+	flag.BoolVar(&enableH2, "http2", false, "Enable HTTP/2 (requires TLS)")
 }
 
 func main() {
@@ -55,6 +59,7 @@ func main() {
 		DisableHeaderNamesNormalizing: true,
 		ReduceMemoryUsage:             false,
 		LogAllErrors:                  false,
+		IdleTimeout:                   1 * time.Second, // crazy (:
 	}
 
 	var tlsCfg *tls.Config
@@ -65,18 +70,43 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to load TLS cert/key: %v", err)
 		}
+
+		alpn := []string{"http/1.1"}
+		if enableH2 {
+			alpn = []string{"h2", "http/1.1"}
+		}
+
 		tlsCfg = &tls.Config{
 			Certificates:     []tls.Certificate{cert},
 			MinVersion:       tls.VersionTLS13,
 			MaxVersion:       tls.VersionTLS13,
-			NextProtos:       []string{"http/1.1"},
+			NextProtos:       alpn,
 			CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 		}
+	}
+
+	if enableH2 {
+		if !tlsEnabled {
+			log.Fatalf("-http2 requires TLS; provide -tls-cert and -tls-key")
+		}
+
+		http2.ConfigureServer(srv, http2.ServerConfig{
+			Debug: debug,
+		})
 	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	errCh := make(chan error, concurrency)
+
+	serve := func(ln net.Listener) {
+		if tlsEnabled {
+			ln = tls.NewListener(ln, tlsCfg)
+		}
+		if err := srv.Serve(ln); err != nil {
+			errCh <- err
+		}
+	}
 
 	if concurrency > 1 {
 		for i := 0; i < concurrency; i++ {
@@ -85,34 +115,20 @@ func main() {
 				log.Fatalf("failed to create listener %d on %s: %v", i, addr, err)
 			}
 
-			if tlsEnabled {
-				ln = tls.NewListener(ln, tlsCfg)
-				log.Printf("listening (socket %d) on %s with SO_REUSEPORT + TLS1.3", i, addr)
-			} else {
-				log.Printf("listening (socket %d) on %s with SO_REUSEPORT (plaintext)", i, addr)
-			}
-
-			go func(idx int, l net.Listener) {
-				if err := srv.Serve(l); err != nil {
-					errCh <- err
-				}
-			}(i, ln)
+			log.Printf("listening (socket %d) on %s %s", i, addr, ternary(tlsEnabled, "(TLS)", "(plaintext)"))
+			go serve(ln)
 		}
 	} else {
 		go func() {
-			if tlsEnabled {
-				lc := net.ListenConfig{}
-				ln, err := lc.Listen(context.Background(), "tcp", addr)
-				if err != nil {
-					errCh <- err
-					return
-				}
-
-				log.Printf("listening on %s with TLS1.3", addr)
-				errCh <- srv.Serve(tls.NewListener(ln, tlsCfg))
-			} else {
-				errCh <- srv.ListenAndServe(addr)
+			lc := net.ListenConfig{}
+			ln, err := lc.Listen(context.Background(), "tcp", addr)
+			if err != nil {
+				errCh <- err
+				return
 			}
+
+			log.Printf("listening on %s %s", addr, ternary(tlsEnabled, "(TLS)", "(plaintext)"))
+			serve(ln)
 		}()
 	}
 
@@ -167,4 +183,11 @@ func newRequestHandler() fasthttp.RequestHandler {
 		ctx.SetContentTypeBytes(contentType)
 		ctx.Response.SetBodyRaw(payload)
 	}
+}
+
+func ternary[T any](b bool, t, f T) T {
+	if b {
+		return t
+	}
+	return f
 }
