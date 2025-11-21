@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log"
 	"net"
@@ -20,14 +21,18 @@ var (
 	compress    bool
 	debug       bool
 	concurrency int
+	tlsCert     string
+	tlsKey      string
 )
 
 func init() {
-	flag.StringVar(&addr, "addr", ":8080", "Address to listen on")
+	flag.StringVar(&addr, "addr", ":9090", "Address to listen on")
 	flag.StringVar(&serviceName, "service-name", "backend0", "Name of the service to be displayed in response")
 	flag.BoolVar(&compress, "compress", false, "Compress the response payload")
 	flag.BoolVar(&debug, "debug", false, "Debug request host and remote IP")
 	flag.IntVar(&concurrency, "concurrency", 1, "Number of listening sockets (>=2 uses SO_REUSEPORT)")
+	flag.StringVar(&tlsCert, "tls-cert", "", "Path to TLS certificate (PEM). If set, TLS 1.3 is enabled")
+	flag.StringVar(&tlsKey, "tls-key", "", "Path to TLS private key (PEM). If set, TLS 1.3 is enabled")
 }
 
 func main() {
@@ -35,6 +40,7 @@ func main() {
 
 	requestHandler := newRequestHandler()
 	var handler fasthttp.RequestHandler
+
 	if compress {
 		handler = fasthttp.CompressHandlerLevel(requestHandler, fasthttp.CompressBestSpeed)
 	} else {
@@ -51,6 +57,23 @@ func main() {
 		LogAllErrors:                  false,
 	}
 
+	var tlsCfg *tls.Config
+	tlsEnabled := tlsCert != "" && tlsKey != ""
+
+	if tlsEnabled {
+		cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+		if err != nil {
+			log.Fatalf("failed to load TLS cert/key: %v", err)
+		}
+		tlsCfg = &tls.Config{
+			Certificates:     []tls.Certificate{cert},
+			MinVersion:       tls.VersionTLS13,
+			MaxVersion:       tls.VersionTLS13,
+			NextProtos:       []string{"http/1.1"},
+			CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
+		}
+	}
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	errCh := make(chan error, concurrency)
@@ -61,7 +84,14 @@ func main() {
 			if err != nil {
 				log.Fatalf("failed to create listener %d on %s: %v", i, addr, err)
 			}
-			log.Printf("listening (socket %d) on %s with SO_REUSEPORT", i, addr)
+
+			if tlsEnabled {
+				ln = tls.NewListener(ln, tlsCfg)
+				log.Printf("listening (socket %d) on %s with SO_REUSEPORT + TLS1.3", i, addr)
+			} else {
+				log.Printf("listening (socket %d) on %s with SO_REUSEPORT (plaintext)", i, addr)
+			}
+
 			go func(idx int, l net.Listener) {
 				if err := srv.Serve(l); err != nil {
 					errCh <- err
@@ -70,7 +100,19 @@ func main() {
 		}
 	} else {
 		go func() {
-			errCh <- srv.ListenAndServe(addr)
+			if tlsEnabled {
+				lc := net.ListenConfig{}
+				ln, err := lc.Listen(context.Background(), "tcp", addr)
+				if err != nil {
+					errCh <- err
+					return
+				}
+
+				log.Printf("listening on %s with TLS1.3", addr)
+				errCh <- srv.Serve(tls.NewListener(ln, tlsCfg))
+			} else {
+				errCh <- srv.ListenAndServe(addr)
+			}
 		}()
 	}
 
