@@ -13,10 +13,11 @@ WORKDIR $GOPATH/src/benchmark-backend/
 
 COPY go.mod go.mod
 COPY go.sum go.sum
-COPY main.go main.go
 
 RUN go mod download
 RUN go mod verify
+
+COPY main.go main.go
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 	-trimpath \
