@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/dgrr/http2"
+	"github.com/inhies/go-bytesize"
 	"github.com/valyala/fasthttp"
 	"golang.org/x/sys/unix"
 )
@@ -25,17 +27,18 @@ const (
 )
 
 var (
-	addr           string
-	serviceName    string
-	compress       bool
-	debug          bool
-	concurrency    int
-	tlsCert        string
-	tlsKey         string
-	enableH2       bool
-	throughputSize uint64
+	addr              string
+	serviceName       string
+	compress          bool
+	debug             bool
+	concurrency       int
+	tlsCert           string
+	tlsKey            string
+	enableH2          bool
+	writeBufferSize   string
+	throughputSizeRaw string
 
-	filePath = filepath.Join(os.TempDir(), "benchmark-backend.blob")
+	filePath = filepath.Join(os.TempDir(), "benchmark-backend", "file.blob")
 )
 
 func init() {
@@ -47,18 +50,26 @@ func init() {
 	flag.StringVar(&tlsCert, "tls-cert", "", "Path to TLS certificate (PEM)")
 	flag.StringVar(&tlsKey, "tls-key", "", "Path to TLS private key (PEM)")
 	flag.BoolVar(&enableH2, "http2", false, "Enable HTTP/2 (requires TLS)")
-	flag.Uint64Var(&throughputSize, "throughput-size", 0, "Size of the response payload in bytes for throughput testing (MB)")
+	flag.StringVar(&writeBufferSize, "wbuf", "", "Write buffer size")
+	flag.StringVar(&throughputSizeRaw, "throughput-size", "", "Size of the response payload in bytes for throughput testing")
 }
 
 func main() {
 	flag.Parse()
 
 	requestHandler := newRequestHandler()
-	if throughputSize != 0 {
-		ensureBlobFile(throughputSize * mb)
+	if throughputSizeRaw != "" {
+		throughputBytes, err := bytesize.Parse(throughputSizeRaw)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if err := ensureBlobFile(uint64(throughputBytes)); err != nil {
+			log.Fatal(err)
+		}
 
 		// we want to benchmark data throughput
-		requestHandler = newThroughputRequestHandler(throughputSize)
+		requestHandler = newThroughputRequestHandler(uint64(throughputBytes))
 	}
 
 	var handler fasthttp.RequestHandler
@@ -75,9 +86,18 @@ func main() {
 		NoDefaultServerHeader:         true,
 		NoDefaultContentType:          true,
 		DisableHeaderNamesNormalizing: true,
-		ReduceMemoryUsage:             false,
+		ReduceMemoryUsage:             true,
 		LogAllErrors:                  false,
 		IdleTimeout:                   1 * time.Second, // crazy (:
+	}
+
+	if writeBufferSize != "" {
+		wbufSize, err := bytesize.Parse(writeBufferSize)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		srv.WriteBufferSize = int(wbufSize)
 	}
 
 	var tlsCfg *tls.Config
@@ -203,34 +223,23 @@ func newRequestHandler() fasthttp.RequestHandler {
 	}
 }
 
-func newThroughputRequestHandler(size uint64) fasthttp.RequestHandler {
+func newThroughputRequestHandler(_size uint64) fasthttp.RequestHandler {
 	contentType := []byte("application/octet-stream")
-
-	f, err := os.OpenFile(filePath, os.O_RDONLY, 0)
-	if err != nil {
-		log.Fatalf("failed to open blob file %s: %v", filePath, err)
-	}
-	defer f.Close()
-
-	data, err := unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ, unix.MAP_SHARED)
-	if err != nil {
-		log.Fatalf("failed to mmap blob file: %v", err)
-	}
-
-	blob := data
 
 	return func(ctx *fasthttp.RequestCtx) {
 		ctx.SetContentTypeBytes(contentType)
-		ctx.Response.SetBodyRaw(blob)
+		ctx.SendFile(filePath)
 	}
 }
 
 func ensureBlobFile(size uint64) error {
+	if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create tempdir: %w", err)
+	}
+
 	if info, err := os.Stat(filePath); err == nil && uint64(info.Size()) == size {
 		return nil
 	}
-
-	log.Printf("Generating file %s (%d bytes)", filePath, size)
 
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 	if err != nil {
@@ -238,18 +247,14 @@ func ensureBlobFile(size uint64) error {
 	}
 	defer file.Close()
 
-	buf := make([]byte, 1<<20) // 1MB buffer
+	buf := make([]byte, size)
 	rand.Read(buf)
 
-	var written uint64
-	for written < size {
-		n, err := file.Write(buf)
-		if err != nil {
-			return err
-		}
-
-		written += uint64(n)
+	if _, err := file.Write(buf); err != nil {
+		return err
 	}
+
+	log.Printf("generated file %s with %d bytes\n", filePath, size)
 
 	return nil
 }

@@ -24,15 +24,10 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 	-ldflags="-s -w" \
 	-o /bin/benchmark-backend .
 
-FROM scratch
-
-COPY --from=base /usr/share/zoneinfo /usr/share/zoneinfo
-COPY --from=base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=base /etc/passwd /etc/passwd
-COPY --from=base /etc/group /etc/group
+FROM gcr.io/distroless/base-debian12:nonroot
 
 COPY --from=base /bin/benchmark-backend /bin/benchmark-backend
 
-USER small-user:small-user
+USER nonroot
 
 ENTRYPOINT ["/bin/benchmark-backend"]
