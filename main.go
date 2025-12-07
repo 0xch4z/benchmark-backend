@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -37,6 +38,7 @@ var (
 	enableH2          bool
 	writeBufferSize   string
 	throughputSizeRaw string
+	inMemoryBlob      bool
 
 	filePath = filepath.Join(os.TempDir(), "benchmark-backend", "file.blob")
 )
@@ -50,6 +52,7 @@ func init() {
 	flag.StringVar(&tlsCert, "tls-cert", "", "Path to TLS certificate (PEM)")
 	flag.StringVar(&tlsKey, "tls-key", "", "Path to TLS private key (PEM)")
 	flag.BoolVar(&enableH2, "http2", false, "Enable HTTP/2 (requires TLS)")
+	flag.BoolVar(&inMemoryBlob, "in-memory-blob", true, "Enable HTTP/2 (requires TLS)")
 	flag.StringVar(&writeBufferSize, "wbuf", "", "Write buffer size")
 	flag.StringVar(&throughputSizeRaw, "throughput-size", "", "Size of the response payload in bytes for throughput testing")
 }
@@ -223,8 +226,20 @@ func newRequestHandler() fasthttp.RequestHandler {
 	}
 }
 
-func newThroughputRequestHandler(_size uint64) fasthttp.RequestHandler {
+func newThroughputRequestHandler(_ uint64) fasthttp.RequestHandler {
 	contentType := []byte("application/octet-stream")
+
+	if inMemoryBlob {
+		blobBytes, err := os.ReadFile(filePath)
+		if err != nil {
+			panic(err)
+		}
+
+		return func(ctx *fasthttp.RequestCtx) {
+			ctx.SetContentTypeBytes(contentType)
+			bufio.NewWriter(ctx).Write(blobBytes)
+		}
+	}
 
 	return func(ctx *fasthttp.RequestCtx) {
 		ctx.SetContentTypeBytes(contentType)
